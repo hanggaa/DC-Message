@@ -3,11 +3,46 @@ import sys
 import random
 import time
 import threading
+import re
 from datetime import datetime
 from http.client import HTTPSConnection
 from typing import Dict, List
+import pandas as pd
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-CONFIG_FILE = "config.json"
+CREDENTIALS_FILE = "credentials.json"  # Google Sheets API credentials
+
+def extract_sheet_id_from_url(url: str) -> str:
+    """Extract the Google Sheets ID from a URL"""
+    # Pattern for different Google Sheets URL formats
+    patterns = [
+        r"/spreadsheets/d/([a-zA-Z0-9-_]+)",  # Standard URL
+        r"spreadsheets/d/([a-zA-Z0-9-_]+)",   # Modified URL
+        r"^([a-zA-Z0-9-_]+)$"                 # Direct ID
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    
+    raise ValueError("Invalid Google Sheets URL format")
+
+def get_sheet_url_from_user() -> str:
+    """Get and validate the Google Sheets URL from user input"""
+    while True:
+        print("\nPlease enter your Google Sheets URL or ID")
+        print("Make sure the sheet is publicly accessible or shared with the service account email")
+        url = input("URL: ").strip()
+        
+        try:
+            sheet_id = extract_sheet_id_from_url(url)
+            return sheet_id
+        except ValueError:
+            print("Invalid URL format. Please try again.")
+            continue
 
 class ChannelConfig:
     def __init__(self, url: str, id: str, alias: str, messages: List[str], delay: float):
@@ -17,23 +52,15 @@ class ChannelConfig:
         self.messages = messages
         self.delay = delay
 
-    def to_dict(self) -> dict:
-        return {
-            "url": self.url,
-            "id": self.id,
-            "alias": self.alias,
-            "messages": self.messages,
-            "delay": self.delay
-        }
-
     @classmethod
-    def from_dict(cls, data: dict):
+    def from_sheet_row(cls, row_data: List[str]):
+        messages = [msg.strip() for msg in row_data[6].split(',') if msg.strip()]
         return cls(
-            data["url"],
-            data["id"],
-            data.get("alias", data["id"]),
-            data.get("messages", []),
-            data.get("delay", 1.0)
+            url=row_data[3],
+            id=row_data[4],
+            alias=row_data[5] if row_data[5] else row_data[4],
+            messages=messages,
+            delay=float(row_data[7])
         )
 
 class UserConfig:
@@ -42,24 +69,6 @@ class UserConfig:
         self.token = token
         self.channels = channels
         self.alias = alias
-
-    def to_dict(self) -> dict:
-        return {
-            "user_id": self.user_id,
-            "token": self.token,
-            "channels": [channel.to_dict() for channel in self.channels],
-            "alias": self.alias
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict):
-        channels = [ChannelConfig.from_dict(channel_data) for channel_data in data["channels"]]
-        return cls(
-            data["user_id"],
-            data["token"],
-            channels,
-            data.get("alias", data["user_id"])
-        )
 
     def get_display_name(self) -> str:
         return self.alias if self.alias else self.user_id
@@ -79,106 +88,89 @@ def precise_sleep(duration: float, randomize: bool = False, min_random: float = 
         if remaining > 0.1:
             time.sleep(0.1)
 
-def save_config(users: List[UserConfig]):
-    try:
-        with open(CONFIG_FILE, "w") as file:
-            json.dump({"users": [user.to_dict() for user in users]}, file, indent=4)
-        print(f"{get_timestamp()} Configuration saved successfully!")
-    except Exception as e:
-        print(f"{get_timestamp()} Error saving configuration: {e}")
-        sys.exit(1)
+def validate_sheet_structure(values: List[List[str]]) -> bool:
+    """Validate that the sheet has the correct structure"""
+    expected_headers = [
+        "User ID", "User Alias", "Token", "Channel URL", 
+        "Channel ID", "Channel Alias", "Messages", "Delay"
+    ]
+    
+    if not values or len(values) < 2:  # At least headers and one data row
+        print("Error: Sheet is empty")
+        return False
+        
+    headers = values[0]
+    if len(headers) < len(expected_headers):
+        print("Error: Missing columns in sheet")
+        print("Expected columns:", expected_headers)
+        print("Found columns:", headers)
+        return False
+        
+    for expected, found in zip(expected_headers, headers):
+        if expected.lower() != found.lower():
+            print(f"Error: Expected column '{expected}', found '{found}'")
+            return False
+            
+    return True
 
-def load_config() -> List[UserConfig]:
+def load_from_sheets(sheet_id: str) -> List[UserConfig]:
     try:
-        with open(CONFIG_FILE, "r") as file:
-            data = json.load(file)
-            return [UserConfig.from_dict(user_data) for user_data in data["users"]]
-    except FileNotFoundError:
+        # Set up Google Sheets API
+        creds = Credentials.from_service_account_file(
+            CREDENTIALS_FILE,
+            scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
+        )
+        service = build('sheets', 'v4', credentials=creds)
+
+        # Call the Sheets API
+        sheet = service.spreadsheets()
+        result = sheet.values().get(
+            spreadsheetId=sheet_id,
+            range='Sheet1!A1:H1000'  # Include headers for validation
+        ).execute()
+        
+        values = result.get('values', [])
+        if not values:
+            print('No data found in Google Sheets.')
+            return []
+
+        # Validate sheet structure
+        if not validate_sheet_structure(values):
+            return []
+
+        # Process the data (skip header row)
+        users = {}
+        for row in values[1:]:  # Skip header row
+            # Ensure row has all required fields
+            if len(row) < 8:
+                print(f"Skipping incomplete row: {row}")
+                continue
+
+            user_id = row[0]
+            
+            # Create new user if not exists
+            if user_id not in users:
+                users[user_id] = UserConfig(
+                    user_id=user_id,
+                    token=row[2],
+                    channels=[],
+                    alias=row[1] if row[1] else user_id
+                )
+            
+            # Add channel to user
+            channel = ChannelConfig.from_sheet_row(row)
+            users[user_id].channels.append(channel)
+
+        return list(users.values())
+
+    except HttpError as e:
+        print(f"Error accessing Google Sheets: {e}")
+        if e.resp.status == 403:
+            print("Access denied. Make sure the sheet is publicly accessible or shared with the service account.")
         return []
     except Exception as e:
-        print(f"{get_timestamp()} Error loading configuration: {e}")
+        print(f"Error loading Google Sheets: {e}")
         return []
-
-def configure_single_channel(channel_number: int) -> ChannelConfig:
-    print(f"\n--- Channel #{channel_number} Configuration ---")
-    channel_url = input("Enter Discord channel URL: ").strip()
-    channel_id = input("Enter Discord channel ID: ").strip()
-    channel_alias = input("Enter alias for this channel (press Enter to use channel ID): ").strip()
-    
-    while True:
-        try:
-            channel_delay = float(input("Enter delay between messages for this channel (in seconds): "))
-            if channel_delay > 0:
-                break
-            print("Please enter a number greater than 0")
-        except ValueError:
-            print("Please enter a valid number")
-
-    print(f"\nHow many messages should be sent in this channel?")
-    while True:
-        try:
-            num_messages = int(input("Number of messages: "))
-            if num_messages > 0:
-                break
-            print("Please enter a number greater than 0")
-        except ValueError:
-            print("Please enter a valid number")
-
-    messages = []
-    for i in range(num_messages):
-        message = input(f"Enter message #{i+1} for this channel: ").strip()
-        messages.append(message)
-
-    return ChannelConfig(
-        channel_url,
-        channel_id,
-        channel_alias if channel_alias else channel_id,
-        messages,
-        channel_delay
-    )
-
-def configure_single_user(user_number: int) -> UserConfig:
-    print(f"\n=== Configuring User #{user_number} ===")
-    user_id = input("Enter User ID: ").strip()
-    alias = input("Enter alias name for this user (press Enter to skip): ").strip()
-    token = input("Enter Discord token: ").strip()
-    
-    print(f"\nHow many channels should User #{user_number} send messages to?")
-    while True:
-        try:
-            num_channels = int(input("Number of channels: "))
-            if num_channels > 0:
-                break
-            print("Please enter a number greater than 0")
-        except ValueError:
-            print("Please enter a valid number")
-    
-    channels = []
-    for i in range(num_channels):
-        channel = configure_single_channel(i + 1)
-        channels.append(channel)
-    
-    return UserConfig(user_id, token, channels, alias if alias else user_id)
-
-def configure_users():
-    print("\n=== Multi-User Configuration ===")
-    while True:
-        try:
-            num_users = int(input("How many Discord accounts do you want to configure? "))
-            if num_users > 0:
-                break
-            print("Please enter a number greater than 0")
-        except ValueError:
-            print("Please enter a valid number")
-
-    users = []
-    for i in range(num_users):
-        user = configure_single_user(i + 1)
-        users.append(user)
-
-    save_config(users)
-    print(f"\n{get_timestamp()} Configuration completed! {len(users)} users configured.")
-    return users
 
 def send_message(user: UserConfig, channel: ChannelConfig, message: str):
     try:
@@ -246,23 +238,29 @@ def show_configuration_summary(users: List[UserConfig]):
 def show_help():
     print("Discord Multi-User Auto Messenger Help")
     print("Usage:")
-    print("  'python3 auto.py'          : Run the auto messenger")
-    print("  'python3 auto.py --config' : Configure users and channels")
-    print("  'python3 auto.py --help'   : Show this help message")
+    print("  'python3 auto.py'      : Run the auto messenger")
+    print("  'python3 auto.py --help': Show this help message")
+    print("\nGoogle Sheets Template Format:")
+    print("The following columns are required:")
+    print("  - User ID")
+    print("  - User Alias")
+    print("  - Token")
+    print("  - Channel URL")
+    print("  - Channel ID")
+    print("  - Channel Alias")
+    print("  - Messages (comma-separated)")
+    print("  - Delay")
 
 def main():
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--config":
-            users = configure_users()
-            show_configuration_summary(users)
-            return
-        elif sys.argv[1] == "--help":
-            show_help()
-            return
+    if len(sys.argv) > 1 and sys.argv[1] == "--help":
+        show_help()
+        return
 
-    users = load_config()
+    sheet_id = get_sheet_url_from_user()
+    users = load_from_sheets(sheet_id)
+    
     if not users:
-        print(f"{get_timestamp()} No users configured. Please run with --config first.")
+        print(f"{get_timestamp()} No users configured. Please check your Google Sheets configuration.")
         return
 
     show_configuration_summary(users)
