@@ -205,17 +205,32 @@ def send_message(user: UserConfig, channel: ChannelConfig, message: str):
     except Exception as e:
         print(f"{get_timestamp()} Error sending message for user {user.get_display_name()} in channel {channel.alias}: {e}")
 
-def user_message_loop(user: UserConfig):
-    """Function to handle message sending for a single user"""
+def channel_message_loop(user: UserConfig, channel: ChannelConfig):
+    """Function to handle message sending for a single channel"""
     while True:
-        for channel in user.channels:
-            print(f"{get_timestamp()} User {user.get_display_name()} starting messages for channel {channel.alias}")
-            for message in channel.messages:
-                send_message(user, channel, message)
-                precise_sleep(channel.delay)
-                    
-        print(f"{get_timestamp()} User {user.get_display_name()} completed message cycle")
+        print(f"{get_timestamp()} User {user.get_display_name()} starting messages for channel {channel.alias}")
+        for message in channel.messages:
+            send_message(user, channel, message)
+            precise_sleep(channel.delay)
+        print(f"{get_timestamp()} User {user.get_display_name()} completed message cycle for channel {channel.alias}")
         precise_sleep(1.0)  # Short sleep between cycles
+
+def user_message_loop(user: UserConfig):
+    """Function to handle message sending for a single user across all channels in parallel"""
+    channel_threads = []
+    
+    # Create a thread for each channel
+    for channel in user.channels:
+        thread = threading.Thread(
+            target=channel_message_loop,
+            args=(user, channel),
+            daemon=True
+        )
+        channel_threads.append(thread)
+    
+    # Start all channel threads
+    for thread in channel_threads:
+        thread.start()
 
 def show_configuration_summary(users: List[UserConfig]):
     print("\nCurrent Configuration Summary:")
@@ -252,17 +267,17 @@ def main():
 
     show_configuration_summary(users)
     
-    threads = []
+    user_threads = []
     for user in users:
         thread = threading.Thread(
             target=user_message_loop,
             args=(user,),
             daemon=True
         )
-        threads.append(thread)
+        user_threads.append(thread)
 
     print(f"{get_timestamp()} Starting message sending for all users simultaneously...")
-    for thread in threads:
+    for thread in user_threads:
         thread.start()
 
     try:
